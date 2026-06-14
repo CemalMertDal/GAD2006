@@ -1,5 +1,6 @@
 #include "NetBaseCharacter.h"
 #include "NetGameInstance.h"
+#include "NetPlayerState.h"
 
 static UDataTable* SBodyParts = nullptr;
 
@@ -10,7 +11,8 @@ static const TArray<FString> BodyPartNames = {
     TEXT("Hands"),
     TEXT("Legs"),
     TEXT("Beard"),
-    TEXT("Eyebrows")
+    TEXT("Eyebrows"),
+    TEXT("BodyType")
 };
 
 ANetBaseCharacter::ANetBaseCharacter()
@@ -38,31 +40,31 @@ ANetBaseCharacter::ANetBaseCharacter()
     PartEyes = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Eyes"));
     PartEyes->SetupAttachment(PartFace, FName("headSocket"));
 
-	PartEyebrows = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Eyebrows"));
-	PartEyebrows->SetupAttachment(PartFace, FName("headSocket"));
+    PartEyebrows = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Eyebrows"));
+    PartEyebrows->SetupAttachment(PartFace, FName("headSocket"));
 
     static ConstructorHelpers::FObjectFinder<UStaticMesh> SK_Eyes(TEXT("StaticMesh'/Game/StylizedModularChar/Meshes/SM_Eyes.SM_Eyes'"));
     PartEyes->SetStaticMesh(SK_Eyes.Object);
 
     static ConstructorHelpers::FObjectFinder<UDataTable> DT_BodyParts(TEXT("/Script/Engine.DataTable'/Game/Blueprints/DT_BodyParts.DT_BodyParts'"));
     SBodyParts = DT_BodyParts.Object;
+
+    PlayerInfoReceived = false;
 }
 
 void ANetBaseCharacter::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (IsLocallyControlled())
-    {
-        UNetGameInstance* Instance = Cast<UNetGameInstance>(GWorld->GetGameInstance());
-        if (Instance && Instance->PlayerInfo.Ready) {
-            SubmitPlayerInfoToServer(Instance->PlayerInfo);
-        }
-    }
+    if (GetNetMode() == ENetMode::NM_Standalone) return;
+
+    SetActorHiddenInGame(true);
+    CheckPlayerState();
 }
 
 void ANetBaseCharacter::OnConstruction(const FTransform& Transform)
 {
+    Super::OnConstruction(Transform);
     UpdateBodyParts();
 }
 
@@ -73,7 +75,7 @@ void ANetBaseCharacter::Tick(float DeltaTime)
 
 void ANetBaseCharacter::ChangeGender(bool _bIsFemale)
 {
-    PartSelection.bIsFemale = _bIsFemale;
+    BodyPartIndices[(int)EBodyPart::BP_BodyType] = _bIsFemale ? 1 : 0;
     UpdateBodyParts();
 }
 
@@ -84,11 +86,12 @@ void ANetBaseCharacter::UpdateBodyParts()
     ChangeBodyPart(EBodyPart::BP_Hair, 0, false);
     ChangeBodyPart(EBodyPart::BP_Hands, 0, false);
     ChangeBodyPart(EBodyPart::BP_Legs, 0, false);
-	ChangeBodyPart(EBodyPart::BP_Eyebrows, 0, false);
+    ChangeBodyPart(EBodyPart::BP_Eyebrows, 0, false);
 
-    if (PartSelection.bIsFemale)
+    bool bIsFemale = BodyPartIndices[(int)EBodyPart::BP_BodyType] != 0;
+    if (bIsFemale)
     {
-		PartBeard->SetStaticMesh(nullptr);
+        PartBeard->SetStaticMesh(nullptr);
     }
     else
     {
@@ -98,18 +101,21 @@ void ANetBaseCharacter::UpdateBodyParts()
 
 FSMeshAssetList* ANetBaseCharacter::GetBodyPartList(EBodyPart part, bool bIsFemale)
 {
+    if (part == EBodyPart::BP_BodyType) return nullptr;
+
     FString Name = FString::Printf(TEXT("%s%s"), bIsFemale ? TEXT("Female") : TEXT("Male"), *BodyPartNames[(int)part]);
     return SBodyParts ? SBodyParts->FindRow<FSMeshAssetList>(*Name, TEXT("")) : nullptr;
 }
 
 void ANetBaseCharacter::ChangeBodyPart(EBodyPart index, int value, bool DirectSet)
 {
-	if (index == EBodyPart::BP_Beard && PartSelection.bIsFemale) return;
+    bool bIsFemale = BodyPartIndices[(int)EBodyPart::BP_BodyType] != 0;
+    if (index == EBodyPart::BP_Beard && bIsFemale) return;
 
-    FSMeshAssetList* List = GetBodyPartList(index, PartSelection.bIsFemale);
+    FSMeshAssetList* List = GetBodyPartList(index, bIsFemale);
     if (List == nullptr) return;
 
-    int CurrentIndex = PartSelection.Indices[(int)index];
+    int CurrentIndex = BodyPartIndices[(int)index];
 
     if (DirectSet) {
         CurrentIndex = value;
@@ -124,7 +130,7 @@ void ANetBaseCharacter::ChangeBodyPart(EBodyPart index, int value, bool DirectSe
             CurrentIndex %= Num;
     }
 
-    PartSelection.Indices[(int)index] = CurrentIndex;
+    BodyPartIndices[(int)index] = CurrentIndex;
 
     switch (index)
     {
@@ -140,20 +146,67 @@ void ANetBaseCharacter::ChangeBodyPart(EBodyPart index, int value, bool DirectSe
 
 void ANetBaseCharacter::SubmitPlayerInfoToServer_Implementation(FSPlayerInfo Info)
 {
-    PartSelection = Info.BodyParts;
-    if (HasAuthority())
-    {
-        OnRep_PlayerInfoChanged();
+    ANetPlayerState* State = GetPlayerState<ANetPlayerState>();
+    if (State) {
+        State->Data.Nickname = Info.Nickname;
+        State->Data.CustomizationData = Info.CustomizationData;
+        State->Data.TeamID = State->TeamID;
+        PlayerInfoReceived = true;
     }
 }
 
-void ANetBaseCharacter::OnRep_PlayerInfoChanged()
+void ANetBaseCharacter::CheckPlayerState()
 {
-    UpdateBodyParts();
+    ANetPlayerState* State = GetPlayerState<ANetPlayerState>();
+    if (State == nullptr) {
+        UE_LOG(LogTemp, Warning, TEXT("State == nullptr"));
+        GWorld->GetTimerManager().SetTimer(ClientDataCheckTimer, this, &ANetBaseCharacter::CheckPlayerState, 0.25f, false);
+    }
+    else {
+        if (IsLocallyControlled())
+        {
+            UNetGameInstance* Instance = Cast<UNetGameInstance>(GWorld->GetGameInstance());
+            if (Instance) {
+                SubmitPlayerInfoToServer(Instance->PlayerInfo);
+            }
+        }
+        CheckPlayerInfo();
+    }
 }
 
-void ANetBaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+void ANetBaseCharacter::CheckPlayerInfo()
 {
-    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-    DOREPLIFETIME(ANetBaseCharacter, PartSelection);
+    ANetPlayerState* State = GetPlayerState<ANetPlayerState>();
+    if (State && PlayerInfoReceived) {
+        ParseCustomizationData(State->Data.CustomizationData);
+        UpdateBodyParts();
+        OnPlayerInfoChanged();
+        SetActorHiddenInGame(false);
+    }
+    else {
+        UE_LOG(LogTemp, Warning, TEXT("State Not Received!"));
+        GWorld->GetTimerManager().SetTimer(ClientDataCheckTimer, this, &ANetBaseCharacter::CheckPlayerInfo, 0.25f, false);
+    }
+}
+
+FString ANetBaseCharacter::GetCustomizationData()
+{
+    FString Data;
+    for (size_t i = 0; i < (int)EBodyPart::BP_COUNT; i++)
+    {
+        Data += FString::FromInt(BodyPartIndices[i]);
+        if (i < ((int)(EBodyPart::BP_COUNT)-1)) Data += TEXT(",");
+    }
+    return Data;
+}
+
+void ANetBaseCharacter::ParseCustomizationData(FString BodyPartData)
+{
+    TArray<FString> ArrayData;
+    BodyPartData.ParseIntoArray(ArrayData, TEXT(","));
+
+    for (size_t i = 0; i < ArrayData.Num(); i++)
+    {
+        BodyPartIndices[i] = FCString::Atoi(*ArrayData[i]);
+    }
 }

@@ -6,7 +6,7 @@
 #include "NetBaseCharacter.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/SpringArmComponent.h"
-#include "NetAvatar.generated.h"
+#include "NetAvatar.generated.h"	
 
 /**
  * 
@@ -32,9 +32,13 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_IsRunning)
 	bool bIsRunning;
 
+	UPROPERTY(BlueprintReadWrite)
+	float MovementScale;
+	
 	UFUNCTION()
 	void OnRep_IsRunning();
 
+	
 	UFUNCTION(Server, Reliable)
 	void ServerSetRunning(bool bRunning);
 
